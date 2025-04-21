@@ -1,1 +1,756 @@
+library(tidyverse)
+library(cowplot)
+
+
+# setwd 
+setwd("/data/Wolfson-PNU-dementia/UKB_Projects/Ioanna/bj_validation/")
+
+#######################
+#     Data prep       #
+#######################
+
+# read in phenotype data & cog data
+pheno = readRDS("../datasets/78867r675516_MSSevIDPAll_v250724.rds")
+
+# define pseudo-dob
+pheno = pheno %>%
+  mutate(dob = as.Date(
+    paste0(year_of_birth_f34_0_0,"-01-01"),
+    format = "%Y-%m-%d"
+  ))
+pheno = tibble(pheno)
+
+# define function to get prevalent and incident code
+define_incident_prevalent_disease = function(
+    age_col,
+    disease_col,
+    date_col_input,
+    src_col_input
+){
+  
+  dat = pheno %>%
+    mutate(
+      agecol = (as.Date(.data[[date_col_input]],format = "%Y-%m-%d") - dob) /
+        365.25
+    ) %>%
+    mutate(
+      discol = case_when(
+        !is.na(.data[[src_col_input]]) & (is.na(agecol) | agecol < 10) ~ as.character("NA"),
+        !is.na(.data[[src_col_input]]) & agecol <= (age_at_recruitment_f21022_0_0 + 10) ~ "prevalent",
+        !is.na(.data[[src_col_input]]) & agecol > (age_at_recruitment_f21022_0_0 + 10) ~ "incident",
+        is.na(.data[[src_col_input]]) ~ "control"
+      )) 
+  
+  dat = dat %>%
+    mutate(agecol = ifelse(discol=="NA",NA,agecol)) %>%
+    mutate(discol = ifelse(discol=="NA",NA,discol))  
+  
+  dat[[age_col]] = dat$agecol
+  dat[[disease_col]] = dat$discol
+  
+  dat = dat %>%  
+    dplyr::select(-agecol,-discol)
+  
+  message(disease_col)
+  dat %>% 
+    dplyr::count(.data[[disease_col]]) %>%
+    print()
+  pheno <<- dat
+  
+}
+
+# define phenotypes 
+define_incident_prevalent_disease(age_col = "age_at_ms",
+                                  disease_col = "MS_status",
+                                  date_col_input = "date_g35_first_reported_multiple_sclerosis_f131042_0_0",
+                                  src_col_input = "source_of_report_of_g35_multiple_sclerosis_f131043_0_0")
+
+define_incident_prevalent_disease(age_col = "age_at_migraine",
+                                  disease_col = "Migraine_status",
+                                  date_col_input = "date_g43_first_reported_migraine_f131052_0_0",
+                                  src_col_input = "source_of_report_of_g43_migraine_f131053_0_0")
+
+define_incident_prevalent_disease(age_col = "age_at_dementia",
+                                  disease_col = "Dementia_status",
+                                  date_col_input = "date_of_all_cause_dementia_report_f42018_0_0",
+                                  src_col_input = "source_of_all_cause_dementia_report_f42019_0_0")
+
+define_incident_prevalent_disease(age_col = "age_at_pd",
+                                  disease_col = "PD_status",
+                                  date_col_input = "date_g20_first_reported_parkinsons_disease_f131022_0_0",
+                                  src_col_input = "source_of_report_of_g20_parkinsons_disease_f131023_0_0")
+
+
+
+pheno = pheno %>% dplyr::select(-starts_with("R_ML_"))
+
+
+# basic QC filters 
+# EUR ancestry 
+pheno %>% nrow()
+pheno %>% filter(!is.na(genetic_principal_components_f22009_0_1)) %>% nrow()
+pheno = pheno %>% filter(!is.na(genetic_ethnic_grouping_f22006_0_0))
+nrow(pheno)
+
+# remove missing calls 
+pheno = pheno %>% filter(!is.na(R_MSHRA_rs10191329_A))
+pheno = pheno %>% filter(!is.na(R_MSHRA_rs10191329_A_hardcall))
+nrow(pheno)
+
+
+# exclude incident / NA
+
+pheno %>% dplyr::count(MS_status) %>% mutate(pct = 100*n/sum(n),total = sum(n))
+
+
+# overall disease status 
+pheno = pheno %>% 
+  mutate(disease_status = 
+           case_when(
+             MS_status == "prevalent" ~ "MS",
+             MS_status == "control" & PD_status == "prevalent" & Dementia_status=="control" ~ "PD",
+             MS_status == "control" & PD_status == "control" & Dementia_status=="prevalent" ~ "Dementia",
+             MS_status == "control" & PD_status == "control" & Dementia_status=="control" & Migraine_status=="prevalent" ~ "Migraine",
+             MS_status == "control" & PD_status == "control" & Dementia_status=="control" & Migraine_status=="control" ~ "Control"
+           )) %>%
+  mutate(disease_status = factor(
+    disease_status, 
+    levels = c("Control", "Migraine", "MS", "PD", "Dementia")
+  ))
+table(pheno$disease_status)  
+pheno %>% dplyr::count(disease_status) %>% 
+  mutate(total = sum(n))
+
+
+# look at exclusions
+pheno %>%
+  filter(is.na(disease_status)) %>% 
+  dplyr::count(Dementia_status,PD_status,MS_status,Migraine_status) %>% 
+  arrange(desc(n)) 
+pheno %>%
+  filter(is.na(disease_status)) %>% 
+  nrow()
+
+pheno %>%
+  filter(is.na(disease_status)) %>% 
+  dplyr::count(Dementia_status,PD_status) %>% 
+  arrange(desc(n)) %>% 
+  filter(Dementia_status=="prevalent" & PD_status =="prevalent") %>% 
+  mutate(total = sum(n))
+
+pheno %>%
+  filter(is.na(disease_status)) %>% 
+  dplyr::count(Dementia_status,Migraine_status) %>% 
+  arrange(desc(n)) %>% 
+  filter(Dementia_status=="prevalent" & Migraine_status =="prevalent") %>% 
+  mutate(total = sum(n))
+
+
+# 
+dis_cats = c("Attendance allowance","Disability living allowance","Blue badge")
+pheno = pheno %>% 
+  mutate(disability_claim_binary = 
+           case_when(
+             attendancedisabilitymobility_allowance_f6146_0_0 %in% dis_cats |
+               attendancedisabilitymobility_allowance_f6146_0_1 %in% dis_cats |
+               attendancedisabilitymobility_allowance_f6146_0_2 %in% dis_cats ~ "1",
+             attendancedisabilitymobility_allowance_f6146_0_0 == "None of the above" ~ "0",
+             .default = as.character("NA")
+           )) 
+
+# restrict to key columns
+dat = pheno %>%
+  filter(!is.na(disease_status)) %>%
+  dplyr::select(disease_status,age_at_recruitment_f21022_0_0, sex_f31_0_0,genetic_principal_components_f22009_0_1,genetic_principal_components_f22009_0_2,genetic_principal_components_f22009_0_3,genetic_principal_components_f22009_0_4,
+                R_MSHRA_rs10191329_A_hardcall,
+                contains("f20023_0_0"),contains("f399_0_0"),number_of_incorrect_matches_in_round_f399_0_2,contains("f20016_0_0"),contains("20018_0_0"),disability_claim_binary) %>% 
+  dplyr::rename("rs10191329_A" = R_MSHRA_rs10191329_A_hardcall)
+
+
+#######################
+#     Demographics    #
+#######################
+dat = dat %>% 
+  mutate(reaction_time = 
+           ifelse(mean_time_to_correctly_identify_matches_f20023_0_0 < 50 | mean_time_to_correctly_identify_matches_f20023_0_0 > 2000, NA, mean_time_to_correctly_identify_matches_f20023_0_0))
+
+# get N for each test 
+aa = dat %>% 
+  dplyr::count(disease_status) %>%
+  mutate(test = "total")
+  
+a = dat %>% 
+  group_by(disease_status) %>%
+  dplyr::count(count = !is.na(mean_time_to_correctly_identify_matches_f20023_0_0)) %>%
+  filter(count == T) %>%
+  mutate(test = "Reaction time") 
+b = dat %>% 
+  group_by(disease_status) %>%
+  dplyr::count(count = !is.na(dat$fluid_intelligence_score_f20016_0_0)) %>%
+  filter(count == T) %>%
+  mutate(test = "Fluid intelligence")
+
+c = dat %>% 
+  group_by(disease_status) %>%
+  dplyr::count(count = !is.na(dat$prospective_memory_result_f20018_0_0)) %>%
+  filter(count == T) %>%
+  mutate(test = "Prospective memory")
+
+
+counts = bind_rows(aa,a,b,c)   %>%
+  dplyr::select(disease_status,n,test) %>%
+  pivot_wider(id_cols = test,values_from = n,names_from = disease_status)
+counts
+write_csv(counts,"counts.csv")
+
+# get N with cognitive data
+dat %>% 
+  group_by(disease_status) %>%
+  dplyr::count(rs10191329_A) %>% 
+  filter(!is.na(rs10191329_A)) %>%
+  mutate(ac = n*rs10191329_A) %>% 
+  mutate(sum_ac = sum(ac),total_chroms = sum(n)*2) %>%
+  mutate(af = sum_ac/total_chroms)
+
+dat %>% nrow()
+dat %>% dplyr::count(disease_status)
+
+# dominant and recessive encoding 
+dat = dat %>% 
+  mutate(rs10191329_dom = ifelse(rs10191329_A >= 1,"1","0")) %>%
+  mutate(rs10191329_rec = ifelse(rs10191329_A >= 2,"1","0")) 
+
+# demographics & test distros 
+median_iqr = function(x){
+  paste0(median(x,na.rm=T)," (",IQR(x,na.rm=T),")")
+}
+n_prop = function(x){
+  paste0(median(x,na.rm=T)," (",IQR(x,na.rm=T),")")
+}
+
+dat$disability_claim_binary = as.numeric(dat$disability_claim_binary)
+
+count_fx = function(var){
+  dat = dat %>% 
+    group_by(disease_status) %>%
+    filter(!is.na(.data[[var]])) %>%
+    dplyr::count(.data[[var]]) %>%
+    mutate(pct = 100*n/sum(n)) %>%
+    mutate(n_pct = paste0(n, " (",round(pct,1),"%)")) %>%
+    dplyr::select(1,2,5) %>%
+    pivot_wider(names_from = disease_status,values_from = n_pct)
+  colnames(dat)[1] = "variable"
+  dat$variable = as.character(dat$variable)
+  dat
+}
+
+summary = dat %>% 
+  group_by(disease_status) %>%
+  summarise_at(
+    .vars = vars(
+      "age_at_recruitment_f21022_0_0",
+      "reaction_time",
+      "fluid_intelligence_score_f20016_0_0"),
+    .funs = median_iqr) %>%
+  t() %>%
+  data.frame() 
+
+cat_summary = count_fx("sex_f31_0_0") %>%
+  bind_rows(
+    count_fx("rs10191329_A")
+  ) %>%
+  bind_rows(
+    count_fx("prospective_memory_result_f20018_0_0")
+  ) %>%
+  bind_rows(
+    count_fx("disability_claim_binary")
+  )
+summary$variable = rownames(summary)
+summary = summary %>% dplyr::select(variable,everything())
+colnames(summary) = colnames(cat_summary)
+summary = bind_rows(cat_summary,summary)
+write_csv(summary,"demographics.csv")
+summary
+
+
+#######################
+#     Physical        #
+#######################
+
+plot_dat = dat %>% 
+  filter(!is.na(disability_claim_binary) & disease_status=="MS") %>%
+  mutate(disability_claim_binary = ifelse(disability_claim_binary==1,"Yes","No"))
+labs = plot_dat %>% group_by(factor(rs10191329_A)) %>% 
+  dplyr::count(disability_claim_binary) %>%
+  mutate(pct = 100*n/sum(n)) %>%
+  mutate(lab = paste0(n, "/",sum(n),"\n(",round(pct,1),"%)")) %>%
+  filter(disability_claim_binary == "Yes")
+p = ggplot(plot_dat,
+       aes(factor(rs10191329_A),fill=factor(disability_claim_binary)))+
+  geom_bar(position="fill",color="black")+
+  theme_bw()+
+  labs(x="rs10191329-A alleles",y="Proportion",fill="Disability claims?")+
+  scale_fill_brewer(palette="Paired")+
+  geom_text(data =labs ,mapping = aes(`factor(rs10191329_A)`,y=pct/100*0.8,label = lab))
+png("disability_claims_ms.png",res=900,unit="in",width=6,height=4)
+plot(p)
+dev.off()
+
+plot_dat %>% nrow()
+
+glm(data = dat %>% 
+      filter(!is.na(disability_claim_binary) & disease_status=="MS"),
+    disability_claim_binary ~ genetic_principal_components_f22009_0_1 + genetic_principal_components_f22009_0_2 + genetic_principal_components_f22009_0_3 + genetic_principal_components_f22009_0_4+ as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0 +
+      rs10191329_A) %>% 
+  broom::tidy() %>% 
+  mutate(one_tailed_p = 1-pnorm(statistic)) %>% 
+  mutate(or = exp(estimate),lower_ci = exp(estimate - 1.96*std.error),
+         upper_ci = exp(estimate + 1.96*std.error))
+
+#######################
+#     Reaction time   #
+#######################
+
+
+# observational difference
+summ = dat %>% 
+  group_by(disease_status) %>% 
+  summarise_at(.vars = "mean_time_to_correctly_identify_matches_f20023_0_0",
+               .funs = c("mean","sd"),
+               na.rm=T) %>%
+  pivot_wider(names_from = disease_status,values_from = c("mean","sd")) 
+summ %>%
+  select(mean_Control, sd_Control, mean_Dementia, sd_Dementia)
+(summ$mean_Dementia - summ$mean_Control  ) / summ$sd_Dementia
+
+p1 = ggplot(dat,aes(disease_status,reaction_time,fill=factor(rs10191329_A)))+
+  geom_violin()+
+  theme_bw()+
+  scale_fill_brewer(palette="Set3")+
+  geom_boxplot(width=0.1,outlier.shape = NA,position=position_dodge(width=0.9),show.legend=F)+
+  theme(legend.position="top")+
+  labs(x="Cohort",y="Reaction time(ms)",fill="rs10191329-A alleles")
+p1
+
+# model 
+model_dat = dat %>% filter(!is.na(reaction_time))
+model_dat$reaction_time_rint = RNOmni::RankNorm(model_dat$reaction_time)
+
+
+#age vs reaction time
+ggplot(dat,
+       aes(age_at_recruitment_f21022_0_0,reaction_time,col=factor(rs10191329_A)))+
+  facet_wrap(~disease_status)+
+  geom_smooth()
+
+lm(data = model_dat %>%
+     filter(disease_status=="Control"),
+   reaction_time_rint ~ age_at_recruitment_f21022_0_0 * rs10191329_A) %>%
+  broom::tidy()
+
+
+# loop through each disease cohort and do regresion
+res = list()
+for(dis in unique(model_dat$disease_status)){
+  this_dat = model_dat %>% filter(disease_status == dis)
+  counts = this_dat %>% dplyr::count(rs10191329_A)
+  add_model = lm(data = this_dat,
+     reaction_time_rint ~ rs10191329_A) %>% 
+    broom::tidy()
+  adjusted_model = lm(data = this_dat,
+                 reaction_time_rint ~ rs10191329_A + genetic_principal_components_f22009_0_1 + genetic_principal_components_f22009_0_2 + genetic_principal_components_f22009_0_3 + genetic_principal_components_f22009_0_4+ as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0) %>% 
+    broom::tidy()
+
+  adjusted_model_dom = lm(data = this_dat,
+                      reaction_time_rint ~ rs10191329_dom + genetic_principal_components_f22009_0_1 + genetic_principal_components_f22009_0_2 + genetic_principal_components_f22009_0_3 + genetic_principal_components_f22009_0_4+ as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0) %>% 
+    broom::tidy()
+  
+  adjusted_model_rec = lm(data = this_dat,
+                          reaction_time_rint ~ rs10191329_rec + genetic_principal_components_f22009_0_1 + genetic_principal_components_f22009_0_2 + genetic_principal_components_f22009_0_3 + genetic_principal_components_f22009_0_4+ as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0) %>% 
+    broom::tidy()
+  
+  res[[length(res)+1]] = adjusted_model %>% filter(term=="rs10191329_A") %>% mutate(model = "Adjusted") %>% 
+    bind_rows(
+      add_model %>% filter(term=="rs10191329_A") %>% mutate(model = "Unadjusted")
+    ) %>% 
+    bind_rows(
+      adjusted_model_rec %>% filter(term=="rs10191329_rec1") %>% mutate(model = "Recessive")
+    ) %>% 
+    bind_rows(
+      adjusted_model_dom %>% filter(term=="rs10191329_dom1") %>% mutate(model = "Dominant")
+    ) %>% 
+    
+    mutate(cohort = dis) %>% 
+    mutate(n = paste0("N = ",paste0(counts$n,collapse="/"))) %>% 
+    mutate(test = "Reaction time")%>% 
+    mutate(direction = ifelse(estimate>0,"Worse","Better"))
+}
+
+res_dat = do.call("bind_rows",res) 
+res_dat %>% filter(model=="Adjusted")
+p2 = ggplot(res_dat %>% filter(model=="Adjusted"),
+       aes(estimate,cohort,fill=cohort))+
+  geom_errorbarh(mapping = aes(xmin = estimate - 1.96*std.error,xmax = estimate + 1.96*std.error,y=cohort),height=0.1,size=0.1)+
+  geom_point(shape=21,size=3)+
+  theme_bw()+
+  scale_fill_brewer(palette="Set1")+
+  geom_vline(xintercept=0,linetype="dashed")+
+  theme(legend.position = "none")+
+  labs(x="Beta coefficient: per-allele difference\n in RINT(reaction time) ",y="Cohort")
+p2
+disease_model1 = lm(data = model_dat,
+   reaction_time_rint ~ disease_status + as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0) %>% 
+  broom::tidy() %>% 
+  mutate(test = "Reaction time") %>% 
+  mutate(direction = ifelse(estimate > 0,"Worse","Better"))
+
+
+
+#######################
+#  Fluid intelligence #
+#######################
+
+p3 = ggplot(dat,aes(disease_status,fluid_intelligence_score_f20016_0_0,fill=factor(rs10191329_A)))+
+  geom_violin()+
+  theme_bw()+
+  scale_fill_brewer(palette="Set3")+
+  geom_boxplot(width=0.1,outlier.shape = NA,position=position_dodge(width=0.9),show.legend=F)+
+  theme(legend.position="top")+
+  labs(x="Cohort",y="Fluid intelligence score (/13)",fill="rs10191329-A alleles")
+
+
+# model 
+model_dat = dat %>% filter(!is.na(fluid_intelligence_score_f20016_0_0))
+model_dat$fluid_intelligence_rint = RNOmni::RankNorm(model_dat$fluid_intelligence_score_f20016_0_0)
+
+# loop through each disease cohort and do regresion
+res = list()
+for(dis in unique(model_dat$disease_status)){
+  this_dat = model_dat %>% filter(disease_status == dis)
+  counts = this_dat %>% dplyr::count(rs10191329_A)
+  add_model = lm(data = this_dat,
+                 fluid_intelligence_rint ~ rs10191329_A) %>% 
+    broom::tidy()
+  adjusted_model = lm(data = this_dat,
+                      fluid_intelligence_rint ~ rs10191329_A + genetic_principal_components_f22009_0_1 + genetic_principal_components_f22009_0_2 + genetic_principal_components_f22009_0_3 + genetic_principal_components_f22009_0_4+ as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0) %>% 
+    broom::tidy()
+  
+  adjusted_model_dom = lm(data = this_dat,
+                          fluid_intelligence_rint ~ rs10191329_dom + genetic_principal_components_f22009_0_1 + genetic_principal_components_f22009_0_2 + genetic_principal_components_f22009_0_3 + genetic_principal_components_f22009_0_4+ as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0) %>% 
+    broom::tidy()
+  
+  adjusted_model_rec = lm(data = this_dat,
+                          fluid_intelligence_rint ~ rs10191329_rec + genetic_principal_components_f22009_0_1 + genetic_principal_components_f22009_0_2 + genetic_principal_components_f22009_0_3 + genetic_principal_components_f22009_0_4+ as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0) %>% 
+    broom::tidy()
+  
+  res[[length(res)+1]] = adjusted_model %>% filter(term=="rs10191329_A") %>% mutate(model = "Adjusted") %>% 
+    bind_rows(
+      add_model %>% filter(term=="rs10191329_A") %>% mutate(model = "Unadjusted")
+    ) %>% 
+    bind_rows(
+      adjusted_model_rec %>% filter(term=="rs10191329_rec1") %>% mutate(model = "Recessive")
+    ) %>% 
+    bind_rows(
+      adjusted_model_dom %>% filter(term=="rs10191329_dom1") %>% mutate(model = "Dominant")
+    ) %>% 
+    
+    mutate(cohort = dis) %>% 
+    mutate(n = paste0("N = ",paste0(counts$n,collapse="/"))) %>% 
+    mutate(test = "Fluid intelligence")%>% 
+    mutate(direction = ifelse(estimate>0,"Better","Worse"))
+}
+
+overall_res = res_dat
+res_dat = do.call("bind_rows",res) 
+overall_res = bind_rows(overall_res,res_dat)
+
+res_dat %>% filter(model=="Adjusted")
+p4 = ggplot(res_dat %>% filter(model=="Adjusted"),
+           aes(estimate,cohort,fill=cohort))+
+  geom_errorbarh(mapping = aes(xmin = estimate - 1.96*std.error,xmax = estimate + 1.96*std.error,y=cohort),height=0.1,size=0.1)+
+  geom_point(shape=21,size=3)+
+  theme_bw()+
+  scale_fill_brewer(palette="Set1")+
+  geom_vline(xintercept=0,linetype="dashed")+
+  theme(legend.position = "none")+
+  labs(x="Beta coefficient: per-allele difference\n in RINT(reaction time) ",y="Cohort")
+p4
+disease_model2 = lm(data = model_dat,
+   fluid_intelligence_rint ~ disease_status+as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0) %>% 
+  broom::tidy() %>% 
+  mutate(test = "Fluid intelligence") %>% 
+  mutate(direction = ifelse(estimate > 0,"Better","Worse"))
+
+lm(data = model_dat,
+   fluid_intelligence_rint ~ rs10191329_A + disease_status) %>% 
+  broom::tidy() %>% mutate(lower_ci = estimate -1.96*std.error, upper_ci = estimate +1.96*std.error)
+
+
+
+# prospective memory 
+p5 = ggplot(dat,aes(disease_status,prospective_memory_result_f20018_0_0,fill=factor(rs10191329_A)))+
+  geom_violin()+
+  theme_bw()+
+  scale_fill_brewer(palette="Set3")+
+  geom_boxplot(width=0.1,outlier.shape = NA,position=position_dodge(width=0.9),show.legend=F)+
+  theme(legend.position="top")+
+  labs(x="Cohort",y="Pairs matching N mistakes",fill="rs10191329-A alleles")
+
+
+# model 
+dat$prospective_memory_result_f20018_0_0 %>% table
+model_dat = dat %>% filter(!is.na(prospective_memory_result_f20018_0_0)) %>% 
+  mutate(prospective_memory_binary = ifelse(prospective_memory_result_f20018_0_0 %in% c("Correct recall on first attempt") ,0,1))  
+
+
+# loop through each disease cohort and do regresion
+res = list()
+for(dis in unique(model_dat$disease_status)){
+  this_dat = model_dat %>% filter(disease_status == dis)
+  counts = this_dat %>% dplyr::count(rs10191329_A)
+  add_model = glm(data = this_dat,
+                 prospective_memory_binary ~ rs10191329_A,family=binomial(link="logit")) %>% 
+    broom::tidy()
+  adjusted_model = glm(data = this_dat,
+                      prospective_memory_binary ~ rs10191329_A + genetic_principal_components_f22009_0_1 + genetic_principal_components_f22009_0_2 + genetic_principal_components_f22009_0_3 + genetic_principal_components_f22009_0_4+ as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0,
+                      family=binomial(link="logit")) %>% 
+    broom::tidy()
+  
+  adjusted_model_dom = glm(data = this_dat,
+                          prospective_memory_binary ~ rs10191329_dom + genetic_principal_components_f22009_0_1 + genetic_principal_components_f22009_0_2 + genetic_principal_components_f22009_0_3 + genetic_principal_components_f22009_0_4+ as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0,
+  family=binomial(link="logit")) %>% 
+    broom::tidy()
+  
+  adjusted_model_rec = glm(data = this_dat,
+                          prospective_memory_binary ~ rs10191329_rec + genetic_principal_components_f22009_0_1 + genetic_principal_components_f22009_0_2 + genetic_principal_components_f22009_0_3 + genetic_principal_components_f22009_0_4+ as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0,
+                          family=binomial(link="logit")) %>% 
+    broom::tidy()
+  
+  res[[length(res)+1]] = adjusted_model %>% filter(term=="rs10191329_A") %>% mutate(model = "Adjusted") %>% 
+    bind_rows(
+      add_model %>% filter(term=="rs10191329_A") %>% mutate(model = "Unadjusted")
+    ) %>% 
+    bind_rows(
+      adjusted_model_rec %>% filter(term=="rs10191329_rec1") %>% mutate(model = "Recessive")
+    ) %>% 
+    bind_rows(
+      adjusted_model_dom %>% filter(term=="rs10191329_dom1") %>% mutate(model = "Dominant")
+    ) %>% 
+    
+    mutate(cohort = dis) %>% 
+    mutate(n = paste0("N = ",paste0(counts$n,collapse="/"))) %>% 
+    mutate(test = "Prospective memory") %>% 
+    mutate(direction = ifelse(estimate>0,"Worse","Better"))
+}
+
+res_dat = do.call("bind_rows",res) 
+overall_res = bind_rows(overall_res,res_dat)
+res_dat %>% filter(model=="Adjusted")
+p6 = ggplot(res_dat %>% filter(model=="Adjusted"),
+           aes(estimate,cohort,fill=cohort))+
+  geom_errorbarh(mapping = aes(xmin = estimate - 1.96*std.error,xmax = estimate + 1.96*std.error,y=cohort),height=0.1,size=0.1)+
+  geom_point(shape=21,size=3)+
+  theme_bw()+
+  scale_fill_brewer(palette="Set1")+
+  geom_vline(xintercept=0,linetype="dashed")+
+  theme(legend.position = "none")+
+  labs(x="Beta coefficient: per-allele difference\n in RINT(reaction time) ",y="Cohort")
+
+
+
+disease_model3 = glm(data = model_dat,
+   prospective_memory_binary ~ disease_status + as.character(sex_f31_0_0) + age_at_recruitment_f21022_0_0,family = binomial(link="logit")) %>% 
+  broom::tidy() %>% 
+  mutate(test = "Prospective memory") %>% 
+  mutate(direction = ifelse(estimate > 0,"Worse","Better"))
+
+
+# summary 
+
+# plot of disease vs tests 
+p1 = ggplot(dat,aes(disease_status,fill=disease_status,log10(reaction_time)))+
+  geom_boxplot(show.legend = F,outlier.shape = NA)+
+  theme_bw()+
+  scale_fill_brewer(palette="Set1")+
+  labs(x="Cohort",y="Log10 Reaction time (ms)")+
+  theme(legend.position="none")+
+  scale_y_continuous(limits = c(2.5,3.1))+
+  ggtitle("A")
+p1
+
+p2 = ggplot(dat,aes(disease_status,fill=disease_status,fluid_intelligence_score_f20016_0_0))+
+  geom_boxplot(show.legend = F,outlier.shape = NA)+
+  theme_bw()+
+  scale_fill_brewer(palette="Set1")+
+  labs(x="Cohort",y="Fluid intelligence score (/13)")+
+  theme(legend.position="none")+
+  ggtitle("B")
+
+plot_dat = dat %>%
+  filter(!is.na(prospective_memory_result_f20018_0_0)) %>%
+  mutate(prospective_simple = case_when(
+    prospective_memory_result_f20018_0_0 == "Correct recall on first attempt" ~ "1st attempt",
+    prospective_memory_result_f20018_0_0 == "Correct recall on second attempt" ~ "2nd attempt",
+    prospective_memory_result_f20018_0_0 == "Instruction not recalled, either skipped or incorrect" ~ "Incorrect"  
+  ))
+p3 = ggplot(plot_dat,
+       aes(disease_status,
+           fill=prospective_simple))+
+  geom_bar(position="fill")+
+  theme_bw()+
+  scale_color_brewer(palette="Set1")+
+  scale_fill_brewer(palette="Paired")+
+  labs(x="Cohort",fill="Prospective memory",y="Proportion")+
+  ggtitle("C")+
+  theme(legend.position = "top",legend.title.position = "top",legend.spacing.x = unit(6,"in"), legend.text = element_text(margin = margin(r = 15))  )
+
+
+png("disease_associations.png",res=900,units="in",height=8,width=6)
+cowplot::plot_grid(p1,p2,p3,align="v",ncol=1,rel_heights=c(0.3,0.3,0.4))
+dev.off()
+
+overall_res = overall_res %>% 
+  mutate(fdr = p.adjust(p.value,method="fdr")) %>% 
+  mutate(lowerci = estimate - 1.96*std.error) %>%
+  mutate(upperci = estimate + 1.96*std.error) 
+
+write_csv(overall_res,"model_results.csv")
+
+# plot
+
+plot_dat = overall_res %>% filter(model=="Adjusted") %>% 
+  arrange(p.value)
+plot_dat$fulltest = paste0(plot_dat$cohort," (",plot_dat$test,")")
+plot_dat$fulltest = factor(plot_dat$fulltest,ordered=T,levels = plot_dat$fulltest)
+p = ggplot(plot_dat,
+       aes(fulltest,-log10(p.value),size=-log10(p.value),shape=direction,fill=cohort))+
+  geom_point()+
+  scale_shape_manual(values = c(24,25))+
+  theme_bw()+
+  scale_fill_brewer(palette="Set3")+
+  labs(x=" ",y=bquote(-log[10]~P))+
+  geom_hline(yintercept=-log10(0.05),linetype="dashed",color="blue")+
+  geom_hline(yintercept=-log10(0.05/nrow(plot_dat)),linetype="dashed",color="orange")+
+  coord_flip()+
+  guides(size="none",fill="none")+
+  labs(shape = "Direction of rs10191329A effect")+
+  theme(legend.position = c(0.75,0.7),panel.grid = element_blank())
+png("rs10191329_directions.png",res=900,units="in",width = 8,height=5)
+print(p)
+dev.off()
+
+
+
+
+
+ggplot(overall_res,
+       aes(estimate,cohort,fill=model))+
+  theme_bw()+
+  geom_errorbarh(mapping = aes(xmin = lowerci,xmax=upperci,y=cohort),position = ggstance::position_dodgev(0.7))+
+  geom_point(shape=21,position = ggstance::position_dodgev(0.7),size=3)+
+  scale_fill_brewer(palette="Set3")+
+  geom_vline(xintercept=0,linetype="dashed",alpha=0.5)+
+  labs(x="Beta coefficient",y="Cohort",fill="Cognitive test") +
+  geom_text(data = overall_res %>% filter(model=="Adjusted" & fdr < 0.05),
+            mapping = aes(x = upperci,label="*"),position = ggstance::position_dodgev(0.7),hjust=-1)+
+  facet_wrap(~test,nrow=1)
+
+
+
+# disease associations
+disease_dat = bind_rows(disease_model1,disease_model2,disease_model3) %>% 
+  filter(grepl("disease_status",term)) %>% 
+  mutate(term= str_remove_all(term,"disease_status")) %>% 
+  mutate(fdr = p.adjust(p.value,method="fdr")) %>% 
+  dplyr::select(-statistic) %>% 
+  mutate()
+write_csv(disease_dat,"disease_assocs.csv")
+# restrict to ms
+ms = pheno %>% filter(MS_status=="prevalent")
+
+# genos
+glm(data = pheno %>% filter(MS_status %in% c("control","prevalent")) %>%
+      mutate(MS_status = ifelse(MS_status=="prevalent",1,0)),
+   MS_status ~ age_at_recruitment_f21022_0_0 + sex_f31_0_0 + genetic_principal_components_f22009_0_1 + genetic_principal_components_f22009_0_2 + genetic_principal_components_f22009_0_3 + genetic_principal_components_f22009_0_4 + rs10191329_A, 
+   family = binomial(link="logit")) %>% 
+  broom::tidy() %>% 
+  mutate(OR = exp(estimate)) %>%
+  mutate(lowerci = exp(estimate -  1.96*`std.error`)) %>% 
+  mutate(upperci = exp(estimate +  1.96*`std.error`))
+
+
+ms %>% 
+  mutate(rs10191329_A = round(rs10191329_A)) %>% 
+  dplyr::count(rs10191329_A) %>% 
+  filter(!is.na(rs10191329_A)) %>%
+  mutate(ac = n*rs10191329_A) %>% 
+  mutate(sum_ac = sum(ac),total_chroms = sum(n)*2) %>%
+  mutate(af = sum_ac/total_chroms)
+pheno %>% 
+  filter(MS_status=="control") %>%
+  mutate(rs10191329_A = round(rs10191329_A)) %>% 
+  dplyr::count(rs10191329_A) %>% 
+  filter(!is.na(rs10191329_A)) %>%
+  mutate(ac = n*rs10191329_A) %>% 
+  mutate(sum_ac = sum(ac),total_chroms = sum(n)*2) %>%
+  mutate(af = sum_ac/total_chroms)
+
+
+ms %>%
+  group_by(rs10191329_hardcall) %>% 
+  dplyr::count(attendancedisabilitymobility_allowance_f6146_0_0) %>%
+  mutate(prop = n/sum(n))
+
+##############################
+# power 
+##############################
+
+maf = 0.17
+total_n = 100000
+effect_size = 1
+
+get_power = function(total_n,maf=0.17,effect_size){
+res=list()
+for(i in c(1:100)){
+# simulate genotypes
+genos = rbinom(total_n,size=2,prob = maf)
+df = data.frame(geno = genos)
+
+wt = df %>% filter(geno == 0)
+wt$pheno = rnorm(n = nrow(wt),mean = 0)  
+het = df %>% filter(geno == 1)
+het$pheno = rnorm(n = nrow(het),mean = effect_size)  
+hom = df %>% filter(geno == 2)
+hom$pheno = rnorm(n = nrow(hom),mean =2*effect_size)  
+df = bind_rows(wt,het,hom)  
+df$pheno = RNOmni::RankNorm(df$pheno)
+
+model = lm(data = df, pheno ~ geno) %>% broom::tidy() %>%
+  filter(term == "geno")
+res[[i]] = model$estimate>0 & model$p.value < 0.05
+}
+unlist(res)
+sum(unlist(res)) / 100
+}
+
+
+dat = data.frame(
+  expand.grid(c(100,500,1000,2000,3000,4000,5000,6000,7000,8000,9000,10000,50000,100000),seq(0.1,0.4,by=0.1))
+)
+powers = list()
+for(i in c(1:nrow(dat))){
+  powers[[i]] = get_power(total_n = dat$Var1[i],effect_size = dat$Var2[i])
+}
+dat$power = unlist(powers)
+colnames(dat) = c("n","effect_size","power")
+options(scipen=999)
+ggplot(dat,aes(n,power,fill=factor(effect_size),color=factor(effect_size)))+
+  geom_point(shape=21,size=3)+
+  scale_x_log10()+
+  geom_vline(xintercept = 1993,linetype="dashed")+
+  geom_hline(yintercept=0.8,linetype="dashed")+
+  geom_smooth(alpha=0.5,se=F)+
+  theme_bw()
+
+get_power(total_n=1993,maf=0.17,effect_size=0.15)
 
